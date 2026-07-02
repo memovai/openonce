@@ -24,6 +24,7 @@ import inspect
 import json
 import time
 import uuid
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -53,6 +54,80 @@ DEFAULT_UNKNOWN_EXCEPTIONS: tuple[type[BaseException], ...] = (
     ConnectionResetError,
     BrokenPipeError,
 )
+
+#: Third-party libraries (requests, httpx, urllib3, aiohttp) raise timeouts
+#: that are NOT subclasses of builtin TimeoutError, so type matching alone
+#: silently misclassifies "the request may have landed" as a definitive
+#: failure — the exact bug this library exists to prevent. Classification
+#: therefore also walks type(exc).__mro__ *names*. Exact class-name matches,
+#: checked against every class in the MRO.
+DEFAULT_UNKNOWN_EXCEPTION_NAMES: frozenset[str] = frozenset(
+    {
+        # requests / urllib3 — raised after the request may have been sent
+        "ReadTimeout",
+        "ReadTimeoutError",
+        "ConnectionError",  # wraps mid-flight resets too; never assume "not sent"
+        "ProtocolError",
+        "RemoteDisconnected",
+        "IncompleteRead",
+        "ChunkedEncodingError",
+        # httpx
+        "TimeoutException",
+        "WriteTimeout",
+        "PoolTimeout",
+        "ReadError",
+        "WriteError",
+        "NetworkError",
+        # aiohttp
+        "ServerTimeoutError",
+        "ServerDisconnectedError",
+        "ClientOSError",
+        # generic
+        "Timeout",
+        "SocketTimeout",
+    }
+)
+
+#: Connect-phase failures: the connection was never established, so nothing
+#: was sent — definitively retryable. Checked BEFORE the unknown sets, since
+#: e.g. requests.ConnectTimeout also has "Timeout"/"ConnectionError" in its MRO.
+DEFAULT_RETRYABLE_EXCEPTION_NAMES: frozenset[str] = frozenset(
+    {
+        "ConnectTimeout",
+        "ConnectTimeoutError",
+        "ConnectError",
+        "ConnectionRefusedError",
+        "NewConnectionError",
+        "ClientConnectorError",
+        "NameResolutionError",
+        "gaierror",
+    }
+)
+
+
+def classify_exception(
+    exc: BaseException,
+    *,
+    unknown_types: tuple[type[BaseException], ...] = DEFAULT_UNKNOWN_EXCEPTIONS,
+    unknown_names: frozenset[str] = DEFAULT_UNKNOWN_EXCEPTION_NAMES,
+    retryable_names: frozenset[str] = DEFAULT_RETRYABLE_EXCEPTION_NAMES,
+) -> str:
+    """Classify a handler exception: ``"retryable"`` / ``"unknown"`` / ``"failed"``.
+
+    Explicit signals win; then connect-phase (retryable) name matches; then
+    outcome-ambiguous type or name matches; anything else is a definitive
+    business failure (cached and replayed).
+    """
+    if isinstance(exc, RetryableEffectError):
+        return "retryable"
+    if isinstance(exc, UnknownOutcomeError):
+        return "unknown"
+    mro_names = {cls.__name__ for cls in type(exc).__mro__}
+    if mro_names & retryable_names:
+        return "retryable"
+    if isinstance(exc, unknown_types) or (mro_names & unknown_names):
+        return "unknown"
+    return "failed"
 
 
 @dataclass(frozen=True)
@@ -98,6 +173,8 @@ class Runtime:
         wait_timeout: float = 30.0,
         wait_poll_interval: float = 0.05,
         unknown_exceptions: tuple[type[BaseException], ...] = DEFAULT_UNKNOWN_EXCEPTIONS,
+        unknown_exception_names: frozenset[str] = DEFAULT_UNKNOWN_EXCEPTION_NAMES,
+        retryable_exception_names: frozenset[str] = DEFAULT_RETRYABLE_EXCEPTION_NAMES,
         worker_id: str | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -107,6 +184,8 @@ class Runtime:
         self.wait_timeout = wait_timeout
         self.wait_poll_interval = wait_poll_interval
         self.unknown_exceptions = unknown_exceptions
+        self.unknown_exception_names = unknown_exception_names
+        self.retryable_exception_names = retryable_exception_names
         self.worker_id = worker_id or f"w_{uuid.uuid4().hex[:12]}"
         self.clock = clock
 
@@ -297,51 +376,37 @@ class Runtime:
         token = _current.set(ctx)
         try:
             value = fn(**args)
-        except RetryableEffectError as exc:
-            # Definitively did not happen. Re-arm if attempts remain.
-            if started.attempt < started.max_attempts:
-                self.store.transition(
+        except Exception as exc:
+            # KeyboardInterrupt/SystemExit deliberately propagate uncaught:
+            # the record stays STARTED, its lease expires, and the reconciler
+            # treats it as the crash it effectively is.
+            kind = classify_exception(
+                exc,
+                unknown_types=self.unknown_exceptions,
+                unknown_names=self.unknown_exception_names,
+                retryable_names=self.retryable_exception_names,
+            )
+            if kind == "retryable":
+                return self._retry_or_fail(fn, started, args, exc)
+            if kind == "unknown":
+                parked = self.store.transition(
                     started.effect_id,
                     {S.STARTED},
-                    S.UNKNOWN,  # via UNKNOWN->APPROVED to keep the table honest
-                    payload={"error": str(exc), "class": "retryable"},
+                    S.UNKNOWN,
+                    payload={"error": repr(exc), "class": f"unknown({type(exc).__name__})"},
                     require_lease_owner=self.worker_id,
                 )
-                rearmed = self.store.transition(
-                    started.effect_id,
-                    {S.UNKNOWN},
-                    S.APPROVED,
-                    payload={"reason": "retryable error; re-armed", "attempt": started.attempt},
-                )
-                if rearmed is not None:
-                    return self._run_attempt(fn, rearmed, args)
-            return self._record_failure(started, exc)
-        except UnknownOutcomeError as exc:
-            parked = self.store.transition(
-                started.effect_id,
-                {S.STARTED},
-                S.UNKNOWN,
-                payload={"error": str(exc), "class": "unknown"},
-                require_lease_owner=self.worker_id,
-            )
-            raise EffectUnknown(parked or started, exc) from exc
-        except self.unknown_exceptions as exc:
-            parked = self.store.transition(
-                started.effect_id,
-                {S.STARTED},
-                S.UNKNOWN,
-                payload={"error": repr(exc), "class": "unknown(default)"},
-                require_lease_owner=self.worker_id,
-            )
-            raise EffectUnknown(parked or started, exc) from exc
-        except Exception as exc:
+                raise EffectUnknown(parked or started, exc) from exc
             return self._record_failure(started, exc)
         finally:
             _current.reset(token)
 
         # Success: receipt, then commit. Two transitions, two journal entries —
         # verification hooks slot between them later without a schema change.
-        result = EffectResult(ok=True, value=_jsonable(value))
+        # The result is canonicalized (JSON round-trip) so the first caller and
+        # every replay observe the IDENTICAL value.
+        value = _canonical_result(value, started.tool)
+        result = EffectResult(ok=True, value=value)
         receipted = self.store.transition(
             started.effect_id,
             {S.STARTED},
@@ -358,6 +423,28 @@ class Runtime:
             raise EffectUnknown(fresh or started)
         self.store.transition(receipted.effect_id, {S.RECEIPT_RECORDED}, S.COMMITTED, payload={})
         return value
+
+    def _retry_or_fail(
+        self, fn: Callable[..., Any], started: EffectRecord, args: dict[str, Any], exc: Exception
+    ) -> Any:
+        """The effect definitively did not happen. Re-arm if attempts remain."""
+        if started.attempt < started.max_attempts:
+            self.store.transition(
+                started.effect_id,
+                {S.STARTED},
+                S.UNKNOWN,  # via UNKNOWN->APPROVED to keep the table honest
+                payload={"error": str(exc), "class": "retryable"},
+                require_lease_owner=self.worker_id,
+            )
+            rearmed = self.store.transition(
+                started.effect_id,
+                {S.UNKNOWN},
+                S.APPROVED,
+                payload={"reason": "retryable error; re-armed", "attempt": started.attempt},
+            )
+            if rearmed is not None:
+                return self._run_attempt(fn, rearmed, args)
+        return self._record_failure(started, exc)
 
     def _record_failure(self, record: EffectRecord, exc: BaseException) -> Any:
         result = EffectResult(ok=False, error=str(exc), error_type=type(exc).__name__)
@@ -377,12 +464,22 @@ class Runtime:
         return record.lease_expires_at is not None and record.lease_expires_at <= self.clock()
 
 
-def _jsonable(value: Any) -> Any:
-    """Ensure the cached result is JSON-serializable (it will be replayed)."""
+def _canonical_result(value: Any, tool: str) -> Any:
+    """JSON round-trip the handler's result so the first caller and every
+    replay observe the identical value (tuples become lists for everyone,
+    not just for replays). Non-serializable results degrade to repr() with
+    a loud warning — replaying an object faithfully is impossible."""
     try:
-        json.dumps(value)
-        return value
+        return json.loads(json.dumps(value))
     except (TypeError, ValueError):
+        warnings.warn(
+            f"{tool}: handler returned non-JSON-serializable "
+            f"{type(value).__name__}; recording repr() — every caller (including "
+            f"this one) receives the repr string. Return JSON-native values for "
+            f"faithful replay.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
         return repr(value)
 
 

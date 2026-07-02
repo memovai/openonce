@@ -25,12 +25,19 @@ from .policy import Decision, Verdict, allow_all, require_approval_for
 from .providers.base import ProbeOutcome, Prober, ProbeResult
 from .reconciler import Reconciler, ReconcileReport
 from .records import EffectRecord, EffectResult, JournalEntry
+from .runtime import (
+    DEFAULT_RETRYABLE_EXCEPTION_NAMES,
+    DEFAULT_UNKNOWN_EXCEPTION_NAMES,
+    classify_exception,
+)
 from .state import EffectState
 from .store import InMemoryStore, SQLiteStore, Store
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "DEFAULT_RETRYABLE_EXCEPTION_NAMES",
+    "DEFAULT_UNKNOWN_EXCEPTION_NAMES",
     "ApprovalPending",
     "Decision",
     "EffectDenied",
@@ -58,6 +65,7 @@ __all__ = [
     "UnknownOutcomeError",
     "Verdict",
     "allow_all",
+    "classify_exception",
     "current_effect",
     "require_approval_for",
 ]
