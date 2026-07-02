@@ -85,13 +85,30 @@ def effect_function_tool(
     tool: str,
     idempotency_fields: list[str] | None = None,
     max_attempts: int = 3,
+    dedup: str = "intent",
     **function_tool_kwargs: Any,
 ) -> Callable[[F], FunctionTool]:
     """Wrap a handler as a durable effect AND an Agents SDK ``FunctionTool``.
 
+    ``dedup`` picks the intent boundary:
+
+    - ``"intent"`` (default): identical whitelisted args within one scope are
+      ONE effect. Required for approval flows — "call again with the same
+      arguments after approval" must land on the same key.
+    - ``"call"``: the LLM's ``tool_call_id`` narrows the scope, so every
+      distinct model decision is its own effect — retries of the *same* tool
+      call (SDK retry, session resume replaying the call) still dedupe, but
+      two independent decisions with identical args both execute. Use for
+      tools where repetition is legitimate ("add item to cart").
+      CAVEAT: incompatible with require-approval policies — the model's
+      post-approval retry carries a NEW call_id and would park a fresh
+      approval forever.
+
     Extra keyword arguments are forwarded to ``function_tool`` (e.g.
     ``strict_mode``, ``is_enabled``).
     """
+    if dedup not in ("intent", "call"):
+        raise ValueError(f"dedup must be 'intent' or 'call', got {dedup!r}")
     function_tool, run_context_wrapper = _require_agents()
 
     def decorator(fn: F) -> FunctionTool:
@@ -105,7 +122,15 @@ def effect_function_tool(
             # The SDK passes parsed arguments positionally per our declared
             # signature; rebind them to names — they are the key material.
             bound = dict(zip(fn_param_names, args, strict=False)) | kwargs
-            with oo.scope(_resolve_scope(ctx, tool)):
+            scope = _resolve_scope(ctx, tool)
+            if dedup == "call":
+                call_id = getattr(ctx, "tool_call_id", None)
+                if call_id:
+                    # Narrowing the SCOPE (not hashing call_id into args)
+                    # keeps the decision boundary visible in record.scope
+                    # for audit, with zero schema change.
+                    scope = f"{scope}/call:{call_id}"
+            with oo.scope(scope):
                 try:
                     return durable(**bound)
                 except ApprovalPending as pending:
