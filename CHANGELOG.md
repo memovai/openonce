@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed (full-codebase review findings)
+- **Critical**: third-party HTTP timeouts (requests/httpx/urllib3/aiohttp)
+  were classified as definitive failures because they don't subclass builtin
+  `TimeoutError` — "maybe happened" was cached and replayed as "didn't
+  happen". Classification now walks `type(exc).__mro__` class names;
+  connect-phase failures auto-retry. `classify_exception` is public API.
+- Probers measured lag windows from `created_at`; a long approval delay
+  could turn a still-propagating miss into a false `NOT_HAPPENED`
+  (duplicate email on the authoritative path). Now measured from `updated_at`.
+- Handler results are canonicalized (JSON round-trip) so the first caller
+  and every replay observe the identical value; non-serializable results
+  degrade to `repr()` with a `RuntimeWarning` for everyone consistently.
+
+### Added
+- OpenAI Agents adapter: `dedup="call"` — the LLM's `tool_call_id` narrows
+  the scope so each model decision is its own effect; retries of the same
+  call still dedupe. Auditable via `record.scope`. Default `"intent"`
+  remains (required for approval flows).
+
 ## 0.1.0 — 2026-07-02
 
 Initial release: durable side effects for AI agent tool calls.
