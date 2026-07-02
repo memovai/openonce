@@ -6,22 +6,40 @@
     openonce --db openonce.db show eff_abc123    # record + full journal
     openonce --db openonce.db approve eff_abc123 --by eric
     openonce --db openonce.db deny eff_abc123 --reason "wrong customer"
+    openonce --db openonce.db reconcile --probers myapp.probers:PROBERS --watch
 
-Read paths never mutate; approve/deny are the only writes.
+``--db`` accepts a SQLite path or a Postgres DSN (``postgres://...`` or
+``host=... dbname=...``). Read paths never mutate; approve/deny/reconcile
+are the only writes.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
+import time
 from datetime import UTC, datetime
 
 from .records import EffectRecord
 from .state import TERMINAL, EffectState
-from .store.sqlite import SQLiteStore
+from .store.base import Store
 
 _ALL_STATES = frozenset(EffectState)
+
+
+def open_store(db: str) -> Store:
+    """SQLite path or Postgres DSN — pick by shape, not by flag."""
+    if db.startswith(("postgres://", "postgresql://")) or (
+        "=" in db and "/" not in db.split("=")[0]
+    ):
+        from .store.postgres import PostgresStore
+
+        return PostgresStore(db)
+    from .store.sqlite import SQLiteStore
+
+    return SQLiteStore(db)
 
 
 def _ts(epoch: float) -> str:
@@ -46,7 +64,7 @@ def _parse_states(raw: str | None) -> frozenset[EffectState]:
         raise SystemExit(f"invalid --state; valid states: {valid}") from None
 
 
-def cmd_ls(store: SQLiteStore, args: argparse.Namespace) -> int:
+def cmd_ls(store: Store, args: argparse.Namespace) -> int:
     recs = store.scan_states(_parse_states(args.state), updated_before=float("inf"))
     for rec in recs:
         print(_row(rec))
@@ -55,7 +73,7 @@ def cmd_ls(store: SQLiteStore, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_review(store: SQLiteStore, args: argparse.Namespace) -> int:
+def cmd_review(store: Store, args: argparse.Namespace) -> int:
     states = {EffectState.REQUIRES_APPROVAL, EffectState.HUMAN_REVIEW, EffectState.UNKNOWN}
     recs = store.scan_states(states, updated_before=float("inf"))
     if not recs:
@@ -69,7 +87,7 @@ def cmd_review(store: SQLiteStore, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_show(store: SQLiteStore, args: argparse.Namespace) -> int:
+def cmd_show(store: Store, args: argparse.Namespace) -> int:
     rec = store.get(args.effect_id)
     if rec is None:
         print(f"no effect {args.effect_id!r}", file=sys.stderr)
@@ -92,7 +110,7 @@ def cmd_show(store: SQLiteStore, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_approve(store: SQLiteStore, args: argparse.Namespace) -> int:
+def cmd_approve(store: Store, args: argparse.Namespace) -> int:
     rec = store.transition(
         args.effect_id,
         {EffectState.REQUIRES_APPROVAL, EffectState.HUMAN_REVIEW},
@@ -106,7 +124,7 @@ def cmd_approve(store: SQLiteStore, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_deny(store: SQLiteStore, args: argparse.Namespace) -> int:
+def cmd_deny(store: Store, args: argparse.Namespace) -> int:
     rec = store.transition(
         args.effect_id,
         {EffectState.REQUIRES_APPROVAL},
@@ -121,9 +139,45 @@ def cmd_deny(store: SQLiteStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile(store: Store, args: argparse.Namespace) -> int:
+    from .reconciler import Reconciler
+
+    probers = {}
+    if args.probers:
+        module_path, _, attr = args.probers.partition(":")
+        if not attr:
+            print("--probers must be module.path:ATTR (a dict[str, Prober])", file=sys.stderr)
+            return 2
+        try:
+            probers = getattr(importlib.import_module(module_path), attr)
+        except (ImportError, AttributeError) as exc:
+            print(f"cannot load probers from {args.probers!r}: {exc}", file=sys.stderr)
+            return 2
+    rec = Reconciler(store, probers=dict(probers), grace_seconds=args.grace)
+
+    loops = 0
+    while True:
+        report = rec.run_once()
+        if report.total() or not args.watch:
+            print(
+                f"reconciled: committed={len(report.committed)} "
+                f"rearmed={len(report.rearmed)} failed={len(report.failed)} "
+                f"escalated={len(report.escalated)}"
+            )
+            for eid in report.escalated:
+                print(f"  needs a human: {eid}")
+        loops += 1
+        if not args.watch or (args.max_loops and loops >= args.max_loops):
+            return 0
+        try:
+            time.sleep(args.interval)
+        except KeyboardInterrupt:  # pragma: no cover
+            return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="openonce", description="Inspect the effect ledger.")
-    p.add_argument("--db", required=True, help="path to the SQLite ledger")
+    p.add_argument("--db", required=True, help="SQLite path or Postgres DSN")
     sub = p.add_subparsers(dest="command", required=True)
 
     ls = sub.add_parser("ls", help="list effects")
@@ -147,12 +201,25 @@ def build_parser() -> argparse.ArgumentParser:
     deny.add_argument("--by", default="cli")
     deny.add_argument("--reason", default="")
     deny.set_defaults(fn=cmd_deny)
+
+    reconcile = sub.add_parser(
+        "reconcile", help="drive UNKNOWN outcomes to resolution (once, or as a daemon)"
+    )
+    reconcile.add_argument(
+        "--probers",
+        help="module.path:ATTR pointing at a dict[str, Prober] keyed by tool name",
+    )
+    reconcile.add_argument("--grace", type=float, default=300.0, help="grace period seconds")
+    reconcile.add_argument("--watch", action="store_true", help="run forever (daemon mode)")
+    reconcile.add_argument("--interval", type=float, default=30.0, help="watch poll seconds")
+    reconcile.add_argument("--max-loops", type=int, default=0, help=argparse.SUPPRESS)
+    reconcile.set_defaults(fn=cmd_reconcile)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    store = SQLiteStore(args.db)
+    store = open_store(args.db)
     result: int = args.fn(store, args)
     return result
 
