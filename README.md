@@ -147,6 +147,26 @@ OpenOnce approvals are re-entrant (same call, same key, proceeds once
 approved) — so the replayed tool call is exactly the right thing, verified
 against the real LangGraph runtime in the test suite.
 
+### OpenAI Agents SDK — signals the model can read
+
+```python
+from openonce.integrations.openai_agents import OpenOnceRunContext, effect_function_tool
+
+@effect_function_tool(oo, tool="stripe.refund", idempotency_fields=["charge"])
+def refund(charge: str) -> str:
+    """Refund a Stripe charge."""
+    ...
+
+result = Runner.run_sync(agent, "refund ch_1",
+                         context=OpenOnceRunContext(openonce_scope="conv-123"))
+```
+
+Control-flow becomes **structured JSON tool outputs the model acts on**:
+`approval_required` tells it to inform the user and call again with the same
+arguments after approval (re-entrant — executes exactly once);
+`outcome_unknown` explicitly instructs *do NOT retry*, the reconciler owns it.
+Safety semantics, translated into model-readable protocol.
+
 ### The receipts, visible
 
 ```console
