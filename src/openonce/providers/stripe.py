@@ -115,7 +115,11 @@ class StripeProber:
                 )
             return ProbeResult(ProbeOutcome.HAPPENED, receipt=receipt, detail="metadata match")
 
-        age = self._clock() - record.created_at
+        # Age from updated_at (the moment it parked as UNKNOWN — the tight
+        # upper bound on when the send attempt happened), NOT created_at:
+        # an approval delay would inflate created_at-age past the indexing
+        # window and turn a still-indexing miss into a false NOT_HAPPENED.
+        age = self._clock() - record.updated_at
         if age < self.indexing_lag_seconds:
             return ProbeResult(
                 ProbeOutcome.INCONCLUSIVE,

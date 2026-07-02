@@ -63,6 +63,18 @@ class TestEmailProber:
         result = prober.probe(record)
         assert result.outcome is ProbeOutcome.NOT_HAPPENED
 
+    def test_approval_delay_does_not_cause_false_not_happened(self, clock) -> None:
+        """The authoritative path has no provider-key backstop, so a false
+        NOT_HAPPENED here means a duplicate email. Age from updated_at."""
+        prober = EmailMessageIdProber(
+            lambda mid: None, sent_store_is_authoritative=True, clock=clock
+        )
+        record = make_record(clock)
+        clock.advance(7200)  # long approval delay
+        record = record.with_(updated_at=clock.now)  # send attempt was just now
+        clock.advance(10)
+        assert prober.probe(record).outcome is ProbeOutcome.INCONCLUSIVE
+
     def test_bare_smtp_miss_stays_inconclusive_forever(self, clock) -> None:
         """Tier-3 honesty: without an authoritative sent store, a miss can
         never prove the mail wasn't delivered — a human decides."""

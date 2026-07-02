@@ -63,6 +63,18 @@ class TestStripeProber:
         assert result.outcome is ProbeOutcome.INCONCLUSIVE
         assert "indexing lag" in result.detail
 
+    def test_approval_delay_does_not_eat_the_indexing_window(self, clock) -> None:
+        """Review finding #2: an effect that sat in approval for hours, then
+        executed and crashed seconds ago, is still inside the indexing window.
+        Age must be measured from updated_at (UNKNOWN parking), not created_at."""
+        prober = StripeProber(RecordingSearch([]), indexing_lag_seconds=120, clock=clock)
+        record = make_record(clock)  # created now...
+        clock.advance(7200)  # ...approved 2h later, executed, crashed:
+        record = record.with_(updated_at=clock.now)  # parked UNKNOWN just now
+        clock.advance(30)  # probe 30s after the send attempt
+        result = prober.probe(record)
+        assert result.outcome is ProbeOutcome.INCONCLUSIVE  # NOT a false NOT_HAPPENED
+
     def test_miss_past_indexing_lag_is_not_happened(self, clock) -> None:
         prober = StripeProber(RecordingSearch([]), indexing_lag_seconds=120, clock=clock)
         record = make_record(clock)

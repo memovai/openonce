@@ -107,7 +107,9 @@ class EmailMessageIdProber:
                 detail="Message-ID present in the sent store",
             )
 
-        age = self._clock() - record.created_at
+        # updated_at, not created_at: see the Stripe prober — approval delays
+        # must not eat the propagation window.
+        age = self._clock() - record.updated_at
         if age < self.propagation_lag_seconds:
             return ProbeResult(
                 ProbeOutcome.INCONCLUSIVE,
