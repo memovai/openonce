@@ -101,6 +101,49 @@ rec.run_once()   # HAPPENED → commit with receipt; NOT_HAPPENED → re-arm;
 | `RetryableEffectError` | definitively did **not** happen | re-executed up to `max_attempts` |
 | `UnknownOutcomeError` / timeouts | **may** have happened | parked `UNKNOWN`, reconciled, never blind-retried |
 
+### Stripe: the tier-1 story, end to end
+
+```python
+from openonce.providers.stripe import StripeProber, effect_metadata
+
+@oo.effect(tool="stripe.charge", idempotency_fields=["customer", "amount_cents"])
+def charge(customer: str, amount_cents: int) -> dict:
+    ctx = openonce.current_effect()
+    return stripe.PaymentIntent.create(
+        amount=amount_cents, currency="usd", customer=customer,
+        idempotency_key=ctx.provider_key,       # Stripe dedupes for 24h
+        metadata=effect_metadata(ctx),          # the probe target
+    )
+
+rec.register("stripe.charge", StripeProber.from_api_key(STRIPE_KEY))
+```
+
+Layered defense: even a wrong `NOT_HAPPENED` probe verdict is survivable,
+because re-execution reuses the same `provider_key` and Stripe replays the
+original response instead of double-charging. The prober is honest about
+Stripe Search's indexing lag — a young miss is `INCONCLUSIVE`, not
+`NOT_HAPPENED`.
+
+### The receipts, visible
+
+```console
+$ openonce --db openonce.db review
+* eff_76cd…  requires_approval  stripe.refund   attempt 0/3  2026-07-02 12:01:07Z
+1 effect(s) need a human. approve/deny by effect_id.
+
+$ openonce --db openonce.db approve eff_76cd… --by eric
+approved eff_76cd… — the agent's next identical call will execute it
+
+$ openonce --db openonce.db show eff_fd61…
+* eff_fd61…  committed  pay.charge  attempt 1/3  2026-07-02 12:03:22Z
+  journal:
+    2026-07-02 12:01:07Z        planned -> approved
+    2026-07-02 12:01:07Z       approved -> started
+    2026-07-02 12:01:09Z        started -> unknown   {"error": "TimeoutError(...)"}
+    2026-07-02 12:03:21Z        unknown -> receipt_recorded  {"probe": "happened", ...}
+    2026-07-02 12:03:22Z receipt_recorded -> committed
+```
+
 ## Install
 
 ```bash
