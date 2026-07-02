@@ -124,6 +124,29 @@ original response instead of double-charging. The prober is honest about
 Stripe Search's indexing lag — a young miss is `INCONCLUSIVE`, not
 `NOT_HAPPENED`.
 
+### LangGraph — one decorator, both problems
+
+LangGraph checkpointing re-runs nodes on resume, re-executing side effects
+(its docs tell you to "use idempotency keys"). `effect_tool` is that layer:
+
+```python
+from openonce.integrations.langgraph import effect_tool
+
+@effect_tool(oo, tool="stripe.refund", idempotency_fields=["charge"])
+def refund(charge: str) -> str:
+    """Refund a Stripe charge."""
+    ...
+
+# scope binds to the LangGraph thread_id automatically; approvals map onto
+# interrupt(): the graph pauses, and a human resumes with
+graph.invoke(Command(resume={"approved": True, "by": "eric"}), config)
+```
+
+The two replay semantics interlock: LangGraph re-runs the node from the top;
+OpenOnce approvals are re-entrant (same call, same key, proceeds once
+approved) — so the replayed tool call is exactly the right thing, verified
+against the real LangGraph runtime in the test suite.
+
 ### The receipts, visible
 
 ```console
