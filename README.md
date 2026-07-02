@@ -93,6 +93,18 @@ rec.run_once()   # HAPPENED → commit with receipt; NOT_HAPPENED → re-arm;
                  # inconclusive / no prober → human review. Never a blind retry.
 ```
 
+Or run it as a daemon straight from the CLI (`PROBERS` is a
+`dict[str, Prober]` in your code):
+
+```console
+$ openonce --db openonce.db reconcile --probers myapp.probers:PROBERS --watch
+```
+
+`--db` also accepts a Postgres DSN — the production store
+(`pip install openonce[postgres]`) passes the identical semantic test suite
+as SQLite and the in-memory reference, including multi-worker
+first-writer-wins.
+
 ### Three failure classes, explicitly
 
 | class | meaning | behavior |
