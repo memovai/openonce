@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 
@@ -27,13 +28,32 @@ def clock() -> FakeClock:
     return FakeClock()
 
 
-@pytest.fixture(params=["memory", "sqlite"])
+PG_TEST_DSN = os.environ.get("OPENONCE_TEST_PG_DSN", "host=/tmp dbname=openonce_test")
+
+
+def _postgres_store(clk: Callable[[], float]):
+    psycopg = pytest.importorskip("psycopg")
+    from openonce.store.postgres import PostgresStore
+
+    try:
+        store = PostgresStore(PG_TEST_DSN, clock=clk)
+    except psycopg.OperationalError as exc:
+        pytest.skip(f"no test Postgres at {PG_TEST_DSN!r}: {exc}")
+    # Isolate tests: the schema persists, the data must not.
+    with psycopg.connect(PG_TEST_DSN) as conn:
+        conn.execute("TRUNCATE effects, effect_journal")
+    return store
+
+
+@pytest.fixture(params=["memory", "sqlite", "postgres"])
 def make_store(request: pytest.FixtureRequest, tmp_path) -> Callable[..., object]:
-    """Factory building either store, so every semantic test runs on both."""
+    """Factory building any store, so every semantic test runs on all of them."""
 
     def factory(clk: Callable[[], float] = time.time):
         if request.param == "memory":
             return InMemoryStore(clock=clk)
+        if request.param == "postgres":
+            return _postgres_store(clk)
         return SQLiteStore(str(tmp_path / "oo.db"), clock=clk)
 
     return factory
