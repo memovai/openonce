@@ -33,11 +33,17 @@ from .state import EffectState as S
 from .store.base import Store
 from .store.sqlite import SQLiteStore
 
-__all__ = ["OpenOnce", "current_effect"]
+__all__ = ["OpenOnce", "current_effect", "current_scope"]
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 _scope: contextvars.ContextVar[str | None] = contextvars.ContextVar("openonce_scope", default=None)
+
+
+def current_scope() -> str | None:
+    """The ambient run scope, if one is set (integrations use this to let an
+    explicit ``oo.scope(...)`` override their own scope derivation)."""
+    return _scope.get()
 
 
 class OpenOnce:
