@@ -78,6 +78,16 @@ def current_effect() -> EffectContext | None:
     return _current.get()
 
 
+def _push_effect_context(ctx: EffectContext | None) -> contextvars.Token[EffectContext | None]:
+    """Internal: re-establish the effect context on another execution context
+    (the async wrapper ships handler coroutines across threads)."""
+    return _current.set(ctx)
+
+
+def _pop_effect_context(token: contextvars.Token[EffectContext | None]) -> None:
+    _current.reset(token)
+
+
 class Runtime:
     def __init__(
         self,

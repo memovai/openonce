@@ -18,6 +18,7 @@ the same call). An explicit idempotency_key opts out of scoping.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import time
@@ -28,7 +29,13 @@ from typing import Any, TypeVar
 from .errors import ScopeRequiredError
 from .policy import Policy, allow_all
 from .records import EffectRecord, JournalEntry
-from .runtime import Runtime, current_effect, is_async_callable
+from .runtime import (
+    Runtime,
+    _pop_effect_context,
+    _push_effect_context,
+    current_effect,
+    is_async_callable,
+)
 from .state import EffectState as S
 from .store.base import Store
 from .store.sqlite import SQLiteStore
@@ -94,32 +101,72 @@ class OpenOnce:
         Handler args must be passed as keywords — they are the key material.
         """
 
+        def check_and_resolve_scope(
+            fn_name: str, posargs: tuple[Any, ...], idempotency_key: str | None
+        ) -> str:
+            if posargs:
+                raise TypeError(
+                    f"{fn_name}: pass arguments as keywords — they are the "
+                    f"idempotency key material and need stable names"
+                )
+            scope = _scope.get()
+            if idempotency_key is None and scope is None:
+                raise ScopeRequiredError(
+                    f"{tool}: derived idempotency keys need a run scope. "
+                    f'Wrap the call in `with oo.scope("run-id"):` or pass '
+                    f"an explicit idempotency_key."
+                )
+            return scope or "_explicit_key"
+
         def decorator(fn: F) -> F:
             if is_async_callable(fn):
-                raise TypeError(
-                    "async handlers are not supported yet (coming with the async "
-                    "runtime); wrap a sync callable or run via asyncio.to_thread"
-                )
+
+                @functools.wraps(fn)
+                async def async_wrapper(
+                    *posargs: Any, idempotency_key: str | None = None, **kwargs: Any
+                ) -> Any:
+                    scope = check_and_resolve_scope(fn.__name__, posargs, idempotency_key)
+                    loop = asyncio.get_running_loop()
+
+                    def shim(**kw: Any) -> Any:
+                        # Runs in the worker thread at the exact point the engine
+                        # invokes the handler; ship the coroutine back to the
+                        # caller's loop, carrying the effect context along.
+                        ectx = current_effect()
+
+                        async def with_ctx() -> Any:
+                            token = _push_effect_context(ectx)
+                            try:
+                                return await fn(**kw)
+                            finally:
+                                _pop_effect_context(token)
+
+                        return asyncio.run_coroutine_threadsafe(with_ctx(), loop).result()
+
+                    # The ledger machinery (short DB transactions + possible
+                    # wait-for-duplicate polling) blocks a to_thread worker,
+                    # never the event loop.
+                    return await asyncio.to_thread(
+                        self.runtime.execute,
+                        shim,
+                        tool=tool,
+                        args=kwargs,
+                        scope=scope,
+                        idempotency_key=idempotency_key,
+                        idempotency_fields=idempotency_fields,
+                        max_attempts=max_attempts,
+                    )
+
+                return async_wrapper  # type: ignore[return-value]
 
             @functools.wraps(fn)
             def wrapper(*posargs: Any, idempotency_key: str | None = None, **kwargs: Any) -> Any:
-                if posargs:
-                    raise TypeError(
-                        f"{fn.__name__}: pass arguments as keywords — they are the "
-                        f"idempotency key material and need stable names"
-                    )
-                scope = _scope.get()
-                if idempotency_key is None and scope is None:
-                    raise ScopeRequiredError(
-                        f"{tool}: derived idempotency keys need a run scope. "
-                        f'Wrap the call in `with oo.scope("run-id"):` or pass '
-                        f"an explicit idempotency_key."
-                    )
+                scope = check_and_resolve_scope(fn.__name__, posargs, idempotency_key)
                 return self.runtime.execute(
                     fn,
                     tool=tool,
                     args=kwargs,
-                    scope=scope or "_explicit_key",
+                    scope=scope,
                     idempotency_key=idempotency_key,
                     idempotency_fields=idempotency_fields,
                     max_attempts=max_attempts,
