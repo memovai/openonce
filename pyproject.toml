@@ -20,6 +20,10 @@ dependencies = []
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
+stripe = ["stripe>=11"]
+
+[project.scripts]
+openonce = "openonce.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.8", "mypy>=1.13"]
