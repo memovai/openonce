@@ -125,12 +125,14 @@ class Runtime:
             max_attempts=max_attempts,
         )
         if not created:
-            record = self._handle_duplicate(record, args, idempotency_key, idempotency_fields)
-            if record.state in REPLAYABLE:
-                return self._replay(record)
-            # APPROVED: approval was granted (or a pre-STARTED crash left it
-            # armed) — this caller takes over execution. Re-entrant by design.
-            return self._run_attempt(fn, record, args)
+            expected_fp = (
+                fingerprint(args)
+                if idempotency_key is not None
+                else fingerprint(select_fields(args, idempotency_fields))
+            )
+            if record.args_fingerprint != expected_fp:
+                raise IdempotencyMismatch(record.idempotency_key)
+            return self._follow(fn, record, args)
 
         record = self._gate(record)
         return self._run_attempt(fn, record, args)
@@ -174,56 +176,46 @@ class Runtime:
         )
         return self.store.create_or_get(record)
 
-    # -- duplicate path -------------------------------------------------- #
+    # -- join path (duplicates and lost races) ----------------------------- #
 
-    def _handle_duplicate(
-        self,
-        record: EffectRecord,
-        args: dict[str, Any],
-        idempotency_key: str | None,
-        idempotency_fields: list[str] | None,
-    ) -> EffectRecord:
-        expected_fp = (
-            fingerprint(args)
-            if idempotency_key is not None
-            else fingerprint(select_fields(args, idempotency_fields))
-        )
-        if record.args_fingerprint != expected_fp:
-            raise IdempotencyMismatch(record.idempotency_key)
-
-        if record.state in REPLAYABLE:
-            return record
-        if record.state == S.REQUIRES_APPROVAL:
-            raise ApprovalPending(record)
-        if record.state in (S.DENIED, S.CANCELED):
-            raise EffectDenied(record)
-        if record.state == S.UNKNOWN or record.state == S.HUMAN_REVIEW:
-            raise EffectUnknown(record)
-        if record.state == S.APPROVED:
-            # Approved but not started (e.g. approval granted after a previous
-            # ApprovalPending, or a crash before STARTED). This caller may run it.
-            return record
-
-        # PLANNED / STARTED / RECEIPT_RECORDED: someone is (or was) executing.
+    def _follow(self, fn: Callable[..., Any], record: EffectRecord, args: dict[str, Any]) -> Any:
+        """Join an effect someone else admitted: replay its result, surface its
+        parked states, take over an armed APPROVED, or wait on an in-flight
+        execution. Used by duplicate callers AND by workers that lose the
+        APPROVED->STARTED race — losing a CAS must mean waiting, not erroring.
+        """
         deadline = self.clock() + self.wait_timeout
-        while self.clock() < deadline:
-            fresh = self.store.get(record.effect_id)
-            assert fresh is not None
-            if fresh.state in REPLAYABLE:
-                return fresh
-            if fresh.state in (S.UNKNOWN, S.HUMAN_REVIEW):
-                raise EffectUnknown(fresh)
-            if fresh.state == S.STARTED and self._lease_expired(fresh):
+        rec: EffectRecord | None = record
+        while True:
+            assert rec is not None
+            if rec.state in REPLAYABLE:
+                return self._replay(rec)
+            if rec.state == S.REQUIRES_APPROVAL:
+                raise ApprovalPending(rec)
+            if rec.state in (S.DENIED, S.CANCELED):
+                raise EffectDenied(rec)
+            if rec.state in (S.UNKNOWN, S.HUMAN_REVIEW):
+                raise EffectUnknown(rec)
+            if rec.state == S.APPROVED:
+                # Armed but not running (approval granted, reconciler re-arm,
+                # or a crash before STARTED): this caller takes over. If it
+                # loses the STARTED race, _run_attempt re-enters _follow —
+                # bounded, because every re-entry means the state advanced.
+                return self._run_attempt(fn, rec, args)
+            if rec.state == S.STARTED and self._lease_expired(rec):
                 # Executor died mid-call: outcome ambiguous. Park it.
                 parked = self.store.transition(
-                    fresh.effect_id,
+                    rec.effect_id,
                     {S.STARTED},
                     S.UNKNOWN,
                     payload={"reason": "lease expired while in flight"},
                 )
-                raise EffectUnknown(parked or fresh)
+                raise EffectUnknown(parked or rec)
+            # PLANNED / STARTED / RECEIPT_RECORDED: someone is executing.
+            if self.clock() >= deadline:
+                raise EffectInFlight(rec)
             time.sleep(self.wait_poll_interval)
-        raise EffectInFlight(self.store.get(record.effect_id) or record)
+            rec = self.store.get(record.effect_id)
 
     def _replay(self, record: EffectRecord) -> Any:
         assert record.result is not None, "replayable record must carry a result"
@@ -280,9 +272,11 @@ class Runtime:
             payload={"worker": self.worker_id, "attempt": record.attempt + 1},
         )
         if started is None:
-            # Lost the race to another worker holding APPROVED.
+            # Lost the APPROVED->STARTED race: someone else is executing this
+            # exact effect. Join them — wait and replay their result.
             fresh = self.store.get(record.effect_id)
-            raise EffectInFlight(fresh or record)
+            assert fresh is not None
+            return self._follow(fn, fresh, args)
 
         ctx = EffectContext(
             effect_id=started.effect_id,
