@@ -5,7 +5,7 @@ description = "Durable side effects for AI agent tool calls: at-least-once execu
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Eric", email = "eric@memov.ai" }]
+authors = [{ name = "Ziboyan Wang", email = "eric@memov.ai" }]
 keywords = ["ai-agents", "idempotency", "side-effects", "durable-execution", "tool-calls", "mcp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
