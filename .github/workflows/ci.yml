@@ -35,6 +35,8 @@ jobs:
       - run: uv sync --group dev
       - run: uv run ruff check src tests
       - run: uv run ruff format --check src tests
+      - run: uv run mypy src
+      - run: uv run openonce providers --validate-only --require-reviewed
       - run: uv run pytest -q
 
   build:

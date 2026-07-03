@@ -157,6 +157,8 @@ class SQLiteStore:
             for k, v in (set_fields or {}).items():
                 if k == "result" and isinstance(v, EffectResult):
                     sets["result_json"] = v.to_json()
+                elif k == "result" and v is None:
+                    sets["result_json"] = None
                 else:
                     sets[k] = v
             if lease_owner is not None:

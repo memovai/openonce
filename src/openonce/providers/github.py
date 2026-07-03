@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from ..records import EffectRecord
@@ -79,21 +79,74 @@ class GitHubPullRequestProber:
             )
 
         pulls = self._list_pulls(owner, repo, head)
-        if pulls:
-            first = pulls[0]
+        if not pulls:
             return ProbeResult(
-                ProbeOutcome.HAPPENED,
-                receipt={
-                    "number": first.get("number"),
-                    "html_url": first.get("html_url"),
-                    "state": first.get("state"),
-                },
-                detail=f"PR exists for head {owner}:{head}",
+                ProbeOutcome.NOT_HAPPENED,
+                detail=(
+                    f"no PR (any state) for head {owner}:{head} — the PR list is an "
+                    f"authoritative primary-store read, so a miss means it was not created"
+                ),
             )
+
+        matches = [pull for pull in pulls if _pull_matches_head(pull, owner, head)]
+        if not matches:
+            return ProbeResult(
+                ProbeOutcome.INCONCLUSIVE,
+                detail=(
+                    f"GitHub returned {len(pulls)} PR(s), but none carried the requested "
+                    f"head {owner}:{head}; cannot trust this as a natural-key proof"
+                ),
+            )
+        if len(matches) > 1:
+            return ProbeResult(
+                ProbeOutcome.INCONCLUSIVE,
+                detail=(
+                    f"GitHub returned {len(matches)} PRs for natural key {owner}:{head}; "
+                    "multiple matches require human review"
+                ),
+            )
+
+        [first] = matches
+        head_data = first.get("head")
+        head_label = head_data.get("label") if isinstance(head_data, dict) else f"{owner}:{head}"
+        head_ref = head_data.get("ref") if isinstance(head_data, dict) else None
+        if not isinstance(head_ref, str):
+            head_ref = head
         return ProbeResult(
-            ProbeOutcome.NOT_HAPPENED,
-            detail=(
-                f"no PR (any state) for head {owner}:{head} — the PR list is an "
-                f"authoritative primary-store read, so a miss means it was not created"
-            ),
+            ProbeOutcome.HAPPENED,
+            receipt={
+                "number": first.get("number"),
+                "html_url": first.get("html_url"),
+                "state": first.get("state"),
+                "head": head_ref,
+                "head_label": head_label,
+            },
+            detail=f"PR exists for head {owner}:{head}",
         )
+
+
+def _pull_matches_head(pull: Mapping[str, Any], owner: str, head: str) -> bool:
+    head_data = pull.get("head")
+    if not isinstance(head_data, dict):
+        return False
+
+    ref = head_data.get("ref")
+    label = head_data.get("label")
+    if ref != head and label != f"{owner}:{head}":
+        return False
+
+    owner_logins = _head_owner_logins(head_data)
+    return owner in owner_logins or label == f"{owner}:{head}"
+
+
+def _head_owner_logins(head_data: Mapping[str, Any]) -> set[str]:
+    logins: set[str] = set()
+    user = head_data.get("user")
+    if isinstance(user, dict) and isinstance(user.get("login"), str):
+        logins.add(user["login"])
+    repo = head_data.get("repo")
+    if isinstance(repo, dict):
+        repo_owner = repo.get("owner")
+        if isinstance(repo_owner, dict) and isinstance(repo_owner.get("login"), str):
+            logins.add(repo_owner["login"])
+    return logins

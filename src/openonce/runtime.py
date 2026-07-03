@@ -41,6 +41,13 @@ from .errors import (
 )
 from .keys import derive_key, fingerprint, select_fields
 from .policy import Decision, Policy, Verdict, allow_all
+from .providers.capabilities import (
+    ProviderCapability,
+    capabilities_for_tool,
+    capability_guidance_for_tool,
+    capability_matrix,
+    provider_receipt_contract_failures,
+)
 from .records import EffectRecord, EffectResult, new_effect_id
 from .state import REPLAYABLE
 from .state import EffectState as S
@@ -175,6 +182,10 @@ class Runtime:
         unknown_exceptions: tuple[type[BaseException], ...] = DEFAULT_UNKNOWN_EXCEPTIONS,
         unknown_exception_names: frozenset[str] = DEFAULT_UNKNOWN_EXCEPTION_NAMES,
         retryable_exception_names: frozenset[str] = DEFAULT_RETRYABLE_EXCEPTION_NAMES,
+        extra_capabilities: tuple[ProviderCapability, ...] | None = None,
+        provider_capabilities: dict[str, str] | None = None,
+        enforce_provider_receipts: bool = False,
+        require_provider_capability_for_receipts: bool = False,
         worker_id: str | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -186,6 +197,13 @@ class Runtime:
         self.unknown_exceptions = unknown_exceptions
         self.unknown_exception_names = unknown_exception_names
         self.retryable_exception_names = retryable_exception_names
+        self.capabilities = capability_matrix(extra_capabilities or ())
+        # Copy: never alias caller state.
+        self.provider_capabilities = dict(provider_capabilities or {})
+        for tool, capability in self.provider_capabilities.items():
+            self._validate_provider_capability(tool, capability)
+        self.enforce_provider_receipts = enforce_provider_receipts
+        self.require_provider_capability_for_receipts = require_provider_capability_for_receipts
         self.worker_id = worker_id or f"w_{uuid.uuid4().hex[:12]}"
         self.clock = clock
 
@@ -205,26 +223,73 @@ class Runtime:
         """Run ``fn(**args)`` as a durable effect. Returns fn's value, or the
         cached value for a duplicate key. Raises the errors documented in
         :mod:`openonce.errors`."""
+        key, fp = self._key_and_fingerprint(
+            tool,
+            args,
+            scope=scope,
+            idempotency_key=idempotency_key,
+            idempotency_fields=idempotency_fields,
+        )
+
+        # The ledger is consulted BEFORE any preflight gate: an effect that
+        # already exists must replay / join / surface its parked state no
+        # matter what enforcement is configured today. Preflight only ever
+        # gates the admission of NEW intents — otherwise enabling enforcement
+        # would break the core invariants (cached replay, a-400-stays-a-400,
+        # approval re-entry via same-key retry).
+        existing = self.store.get_by_key(key)
+        if existing is not None:
+            if existing.args_fingerprint != fp:
+                raise IdempotencyMismatch(existing.idempotency_key)
+            return self._follow(fn, existing, args)
+
+        preflight_failures = self._provider_contract_preflight_failures(
+            tool,
+            args,
+            idempotency_key=idempotency_key,
+            idempotency_fields=idempotency_fields,
+        )
+        if preflight_failures:
+            # Nothing has been inserted: the caller can fix the contract and
+            # retry the same key without a poisoned ledger entry in the way.
+            raise ValueError(
+                f"{tool!r} provider contract preflight failed: {'; '.join(preflight_failures)}"
+            )
+
         record, created = self._admit(
             tool=tool,
             args=args,
             scope=scope,
-            idempotency_key=idempotency_key,
-            idempotency_fields=idempotency_fields,
+            key=key,
+            fp=fp,
             max_attempts=max_attempts,
         )
         if not created:
-            expected_fp = (
-                fingerprint(args)
-                if idempotency_key is not None
-                else fingerprint(select_fields(args, idempotency_fields))
-            )
-            if record.args_fingerprint != expected_fp:
+            # Raced another admitter between the lookup and the insert.
+            if record.args_fingerprint != fp:
                 raise IdempotencyMismatch(record.idempotency_key)
             return self._follow(fn, record, args)
 
         record = self._gate(record)
         return self._run_attempt(fn, record, args)
+
+    def _key_and_fingerprint(
+        self,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        scope: str,
+        idempotency_key: str | None,
+        idempotency_fields: list[str] | None,
+    ) -> tuple[str, str]:
+        if idempotency_key is not None:
+            # Explicit key: fingerprint covers ALL args (Stripe semantics —
+            # same key + different params is caller error).
+            return idempotency_key, fingerprint(args)
+        # Derived key: fingerprint covers exactly the key material, so
+        # whitelisted-field matches replay even if noise fields differ.
+        key = derive_key(tool, args, scope=scope, fields=idempotency_fields)
+        return key, fingerprint(select_fields(args, idempotency_fields))
 
     # -- phase 1: admission -------------------------------------------- #
 
@@ -234,21 +299,10 @@ class Runtime:
         tool: str,
         args: dict[str, Any],
         scope: str,
-        idempotency_key: str | None,
-        idempotency_fields: list[str] | None,
+        key: str,
+        fp: str,
         max_attempts: int,
     ) -> tuple[EffectRecord, bool]:
-        if idempotency_key is not None:
-            key = idempotency_key
-            # Explicit key: fingerprint covers ALL args (Stripe semantics —
-            # same key + different params is caller error).
-            fp = fingerprint(args)
-        else:
-            key = derive_key(tool, args, scope=scope, fields=idempotency_fields)
-            # Derived key: fingerprint covers exactly the key material, so
-            # whitelisted-field matches replay even if noise fields differ.
-            fp = fingerprint(select_fields(args, idempotency_fields))
-
         effect_id = new_effect_id()
         record = EffectRecord(
             effect_id=effect_id,
@@ -421,6 +475,20 @@ class Runtime:
             if fresh is not None and fresh.state in REPLAYABLE:
                 return self._replay(fresh)
             raise EffectUnknown(fresh or started)
+        contract_failures = self._provider_receipt_contract_failures(receipted, args, value)
+        if contract_failures:
+            detail = (
+                f"handler receipt for {receipted.tool!r} does not satisfy provider "
+                f"contract: {'; '.join(contract_failures)}"
+            )
+            reviewed = self.store.transition(
+                receipted.effect_id,
+                {S.RECEIPT_RECORDED},
+                S.HUMAN_REVIEW,
+                set_fields={"note": detail},
+                payload={"receipt_contract": "failed", "failures": list(contract_failures)},
+            )
+            raise EffectUnknown(reviewed or receipted)
         self.store.transition(receipted.effect_id, {S.RECEIPT_RECORDED}, S.COMMITTED, payload={})
         return value
 
@@ -462,6 +530,79 @@ class Runtime:
 
     def _lease_expired(self, record: EffectRecord) -> bool:
         return record.lease_expires_at is not None and record.lease_expires_at <= self.clock()
+
+    def _provider_receipt_contract_failures(
+        self, record: EffectRecord, args: dict[str, Any], receipt: object
+    ) -> tuple[str, ...]:
+        if not self.enforce_provider_receipts:
+            return ()
+        capability = self.provider_capabilities.get(record.tool)
+        matches = capabilities_for_tool(record.tool, capability, capabilities=self.capabilities)
+        if self.require_provider_capability_for_receipts and not matches:
+            if capability is not None:
+                return (f"no provider capability {capability!r} matches {record.tool!r}",)
+            return (f"no provider capability matches {record.tool!r}",)
+        return provider_receipt_contract_failures(
+            record.tool,
+            args,
+            receipt,
+            capability,
+            capabilities=self.capabilities,
+        )
+
+    def _provider_contract_preflight_failures(
+        self,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        idempotency_key: str | None,
+        idempotency_fields: list[str] | None,
+    ) -> tuple[str, ...]:
+        if not self.enforce_provider_receipts:
+            return ()
+
+        capability = self.provider_capabilities.get(tool)
+        matches = capabilities_for_tool(tool, capability, capabilities=self.capabilities)
+        if not matches:
+            if self.require_provider_capability_for_receipts:
+                if capability is not None:
+                    return (f"no provider capability {capability!r} matches {tool!r}",)
+                return (f"no provider capability matches {tool!r}",)
+            return ()
+
+        key_fields = set(args) if idempotency_fields is None else set(idempotency_fields)
+        failures: list[str] = []
+        for cap in matches:
+            missing_args = tuple(field for field in cap.required_args if field not in args)
+            if missing_args:
+                failures.append(
+                    f"provider capability {cap.name!r} requires handler args: "
+                    f"{', '.join(missing_args)}"
+                )
+
+            if idempotency_key is not None and cap.required_idempotency_fields:
+                failures.append(
+                    f"provider capability {cap.name!r} requires derived idempotency_fields "
+                    "instead of an explicit idempotency_key: "
+                    f"{', '.join(cap.required_idempotency_fields)}"
+                )
+                continue
+            missing_key_fields = tuple(
+                field for field in cap.required_idempotency_fields if field not in key_fields
+            )
+            if missing_key_fields:
+                failures.append(
+                    f"provider capability {cap.name!r} requires idempotency_fields: "
+                    f"{', '.join(missing_key_fields)}"
+                )
+        return tuple(failures)
+
+    def _validate_provider_capability(self, tool: str, capability: str) -> None:
+        if capabilities_for_tool(tool, capability, capabilities=self.capabilities):
+            return
+        raise ValueError(
+            capability_guidance_for_tool(tool, capability, capabilities=self.capabilities)
+        )
 
 
 def _canonical_result(value: Any, tool: str) -> Any:

@@ -42,7 +42,8 @@ TRANSITIONS: dict[EffectState, frozenset[EffectState]] = {
     #   probe says "it did not happen"-> APPROVED (re-eligible for execution)
     #   probe inconclusive / absent   -> HUMAN_REVIEW
     S.UNKNOWN: frozenset({S.RECEIPT_RECORDED, S.APPROVED, S.FAILED, S.HUMAN_REVIEW}),
-    # A human resolving a review can commit, allow retry, fail, or cancel.
+    # A human resolving a review can commit, re-arm after confirming not-happened,
+    # fail, or cancel.
     S.HUMAN_REVIEW: frozenset({S.COMMITTED, S.APPROVED, S.FAILED, S.CANCELED}),
     # Explicit operator retry of a failed effect re-arms it.
     S.FAILED: frozenset({S.APPROVED}),

@@ -160,6 +160,8 @@ class PostgresStore:
             for k, v in (set_fields or {}).items():
                 if k == "result" and isinstance(v, EffectResult):
                     sets["result_json"] = v.to_json()
+                elif k == "result" and v is None:
+                    sets["result_json"] = None
                 elif k in _MUTABLE:
                     sets[k] = v
                 else:

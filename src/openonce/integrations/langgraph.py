@@ -124,12 +124,12 @@ def effect_tool(
                     if _approved(decision):
                         oo.approve(pending.effect_id, by=_decided_by(decision))
                         return durable(**kwargs)  # same key -> proceeds once
-                    oo.deny(
+                    denied = oo.deny(
                         pending.effect_id,
                         by=_decided_by(decision),
                         reason=_reason(decision),
                     )
-                    raise EffectDenied(oo.get(pending.effect_id)) from None
+                    raise EffectDenied(denied) from None
 
         wrapped: BaseTool = lc_tool(runner)
         return wrapped

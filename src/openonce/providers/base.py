@@ -10,7 +10,7 @@ knowledge of how to ask that question reliably. Three tiers of provider
 support (see PLAN.md §4):
 
 1. Native idempotency keys (Stripe, ...): pass provider_key through; probe by key.
-2. Natural business keys (GitHub PR (owner, repo, title), email Message-ID):
+2. Natural business keys (GitHub PR (owner, repo, head), email Message-ID):
    probe-before-write / search by the business key.
 3. No idempotency support at all: fuzzy matching only — which is why
    INCONCLUSIVE exists and routes to a human instead of guessing.
