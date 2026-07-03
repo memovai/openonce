@@ -565,6 +565,23 @@ review instead of trusting a suspicious read.
 
 ## Framework integrations
 
+Which SDK, which spelling — every row has a runnable example under
+[`examples/`](examples/):
+
+| Your stack | What you use | Example |
+|---|---|---|
+| **LangGraph** | `integrations.langgraph.effect_tool` — thread-scoped dedup, approval via `interrupt()` | [`examples/langgraph_langchain.py`](examples/langgraph_langchain.py) |
+| **LangChain** plain `@tool` | no adapter — stack `@tool` on `@oo.effect` | same file |
+| **OpenAI Agents SDK** | `integrations.openai_agents.effect_function_tool` — JSON signals the model acts on | [`examples/openai_agents_sdk.py`](examples/openai_agents_sdk.py) |
+| **OpenAI SDK** (bare tool loop) | no adapter — `@oo.effect` on each handler; `tool_call.id` narrows the scope | [`examples/openai_sdk.py`](examples/openai_sdk.py) |
+| **Claude SDK** (`anthropic` manual loop) | no adapter — `@oo.effect` on each handler; pass `ctx.provider_key` to providers | [`examples/anthropic_sdk.py`](examples/anthropic_sdk.py) |
+
+The pattern behind the table: in a bare SDK loop *you* execute the tool
+calls, so the core decorator is the whole integration. Dedicated adapters
+exist only where the framework owns two touchpoints — where the dedup scope
+comes from (thread id, run context) and what surface approvals use
+(`interrupt()`, structured tool outputs). All examples run offline in CI.
+
 **LangGraph** — one decorator makes a handler both a durable effect and a
 LangGraph tool. Scope binds to the `thread_id`; `ApprovalPending` maps onto
 `interrupt()`, and because OpenOnce approvals are re-entrant, LangGraph's
