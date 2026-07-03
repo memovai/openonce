@@ -23,8 +23,10 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import functools
+import inspect
 import json
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any, TypeVar
@@ -63,6 +65,48 @@ def current_scope() -> str | None:
     return _scope.get()
 
 
+def _handler_signature(fn: Callable[..., Any]) -> inspect.Signature:
+    """Validate a handler's signature at decoration time — parameters are
+    idempotency key material, so every argument must have a stable name."""
+    sig = inspect.signature(fn)
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            raise TypeError(
+                f"{fn.__name__}: handlers with *{param.name} are not supported — "
+                f"arguments are idempotency key material and need stable names"
+            )
+        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+            raise TypeError(
+                f"{fn.__name__}: positional-only parameters are not supported — "
+                f"arguments are idempotency key material and need stable names"
+            )
+    return sig
+
+
+def _bind_arguments(
+    sig: inspect.Signature,
+    fn_name: str,
+    posargs: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind positional and keyword arguments to parameter names.
+
+    Positional calls are as stable as keyword calls: the *names* enter the
+    key either way, taken from the handler's own signature.
+    """
+    try:
+        bound = sig.bind(*posargs, **kwargs)
+    except TypeError as exc:
+        raise TypeError(f"{fn_name}: {exc}") from None
+    args: dict[str, Any] = {}
+    for name, value in bound.arguments.items():
+        if sig.parameters[name].kind is inspect.Parameter.VAR_KEYWORD:
+            args.update(value)  # flatten **kwargs into real names
+        else:
+            args[name] = value
+    return args
+
+
 class OpenOnce:
     def __init__(
         self,
@@ -95,11 +139,19 @@ class OpenOnce:
     # -- scoping ----------------------------------------------------------
 
     @contextmanager
-    def scope(self, run_id: str) -> Iterator[None]:
-        """Bind derived idempotency keys to this run. Nesting replaces."""
+    def scope(self, run_id: str | None = None) -> Iterator[str]:
+        """Bind derived idempotency keys to this run. Nesting replaces.
+
+        ``oo.scope()`` with no argument generates a fresh run id — dedup then
+        protects against duplicates *within this run* (LLM retries, node
+        replays), which is where most duplicates come from. For crash-resume
+        dedup across process restarts, pass a stable id you can reproduce.
+        Yields the active run id either way.
+        """
+        run_id = run_id or f"auto-{uuid.uuid4().hex[:12]}"
         token = _scope.set(run_id)
         try:
-            yield
+            yield run_id
         finally:
             _scope.reset(token)
 
@@ -107,43 +159,55 @@ class OpenOnce:
 
     def effect(
         self,
+        fn: F | None = None,
         *,
-        tool: str,
+        tool: str | None = None,
         idempotency_fields: list[str] | None = None,
         max_attempts: int = 3,
-    ) -> Callable[[F], F]:
+    ) -> Any:
         """Wrap a tool handler as a durable effect.
 
-        The wrapped function accepts an extra keyword-only ``idempotency_key``
-        to pass an explicit key (which then doesn't require a scope).
-        Handler args must be passed as keywords — they are the key material.
+        All three spellings work::
+
+            @oo.effect                      # tool name = function name
+            def send(to: str) -> str: ...
+
+            @oo.effect(idempotency_fields=["to"])
+            def send(to: str, body: str) -> str: ...
+
+            protected = oo.effect(existing_tool)   # wrap without decorating
+
+        Arguments may be passed positionally or by keyword — they are bound
+        to parameter names either way, because the names are the idempotency
+        key material. The wrapped function accepts an extra keyword-only
+        ``idempotency_key`` to pass an explicit key (which then doesn't
+        require a scope).
         """
 
-        def check_and_resolve_scope(
-            fn_name: str, posargs: tuple[Any, ...], idempotency_key: str | None
-        ) -> str:
-            if posargs:
-                raise TypeError(
-                    f"{fn_name}: pass arguments as keywords — they are the "
-                    f"idempotency key material and need stable names"
-                )
+        def check_and_resolve_scope(tool_name: str, idempotency_key: str | None) -> str:
             scope = _scope.get()
             if idempotency_key is None and scope is None:
                 raise ScopeRequiredError(
-                    f"{tool}: derived idempotency keys need a run scope. "
-                    f'Wrap the call in `with oo.scope("run-id"):` or pass '
-                    f"an explicit idempotency_key."
+                    f"{tool_name}: derived idempotency keys need a run scope. "
+                    f'Wrap the call in `with oo.scope("run-id"):` (or the no-arg '
+                    f"`with oo.scope():` for in-run dedup only), or pass an "
+                    f"explicit idempotency_key."
                 )
             return scope or "_explicit_key"
 
-        def decorator(fn: F) -> F:
-            if is_async_callable(fn):
+        def decorator(inner: F) -> F:
+            tool_name = tool or inner.__name__
+            sig = _handler_signature(inner)
 
-                @functools.wraps(fn)
+            if is_async_callable(inner):
+                fn_async = inner
+
+                @functools.wraps(fn_async)
                 async def async_wrapper(
                     *posargs: Any, idempotency_key: str | None = None, **kwargs: Any
                 ) -> Any:
-                    scope = check_and_resolve_scope(fn.__name__, posargs, idempotency_key)
+                    bound_args = _bind_arguments(sig, fn_async.__name__, posargs, kwargs)
+                    scope = check_and_resolve_scope(tool_name, idempotency_key)
                     loop = asyncio.get_running_loop()
 
                     def shim(**kw: Any) -> Any:
@@ -155,7 +219,7 @@ class OpenOnce:
                         async def with_ctx() -> Any:
                             token = _push_effect_context(ectx)
                             try:
-                                return await fn(**kw)
+                                return await fn_async(**kw)
                             finally:
                                 _pop_effect_context(token)
 
@@ -167,8 +231,8 @@ class OpenOnce:
                     return await asyncio.to_thread(
                         self.runtime.execute,
                         shim,
-                        tool=tool,
-                        args=kwargs,
+                        tool=tool_name,
+                        args=bound_args,
                         scope=scope,
                         idempotency_key=idempotency_key,
                         idempotency_fields=idempotency_fields,
@@ -177,13 +241,14 @@ class OpenOnce:
 
                 return async_wrapper  # type: ignore[return-value]
 
-            @functools.wraps(fn)
+            @functools.wraps(inner)
             def wrapper(*posargs: Any, idempotency_key: str | None = None, **kwargs: Any) -> Any:
-                scope = check_and_resolve_scope(fn.__name__, posargs, idempotency_key)
+                bound_args = _bind_arguments(sig, inner.__name__, posargs, kwargs)
+                scope = check_and_resolve_scope(tool_name, idempotency_key)
                 return self.runtime.execute(
-                    fn,
-                    tool=tool,
-                    args=kwargs,
+                    inner,
+                    tool=tool_name,
+                    args=bound_args,
                     scope=scope,
                     idempotency_key=idempotency_key,
                     idempotency_fields=idempotency_fields,
@@ -192,6 +257,9 @@ class OpenOnce:
 
             return wrapper  # type: ignore[return-value]
 
+        # Bare-decorator / direct-wrap forms: @oo.effect and oo.effect(fn).
+        if fn is not None:
+            return decorator(fn)
         return decorator
 
     # -- approvals & review -------------------------------------------------

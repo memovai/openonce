@@ -83,7 +83,7 @@ def _thread_scope(get_config: Any) -> str:
 def effect_tool(
     oo: OpenOnce,
     *,
-    tool: str,
+    tool: str | None = None,
     idempotency_fields: list[str] | None = None,
     max_attempts: int = 3,
     approval_via_interrupt: bool = True,
@@ -97,8 +97,9 @@ def effect_tool(
     lc_tool, get_config, interrupt = _require_langgraph()
 
     def decorator(fn: F) -> BaseTool:
+        tool_name = tool or fn.__name__
         durable = oo.effect(
-            tool=tool, idempotency_fields=idempotency_fields, max_attempts=max_attempts
+            tool=tool_name, idempotency_fields=idempotency_fields, max_attempts=max_attempts
         )(fn)
 
         @functools.wraps(fn)
@@ -116,7 +117,7 @@ def effect_tool(
                         {
                             "type": "openonce_approval",
                             "effect_id": pending.effect_id,
-                            "tool": tool,
+                            "tool": tool_name,
                             "args": kwargs,
                             "note": pending.record.note,
                         }

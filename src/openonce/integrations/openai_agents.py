@@ -82,7 +82,7 @@ def _signal(kind: str, effect_id: str, tool: str, **extra: Any) -> str:
 def effect_function_tool(
     oo: OpenOnce,
     *,
-    tool: str,
+    tool: str | None = None,
     idempotency_fields: list[str] | None = None,
     max_attempts: int = 3,
     dedup: str = "intent",
@@ -112,8 +112,9 @@ def effect_function_tool(
     function_tool, run_context_wrapper = _require_agents()
 
     def decorator(fn: F) -> FunctionTool:
+        tool_name = tool or fn.__name__
         durable = oo.effect(
-            tool=tool, idempotency_fields=idempotency_fields, max_attempts=max_attempts
+            tool=tool_name, idempotency_fields=idempotency_fields, max_attempts=max_attempts
         )(fn)
 
         fn_param_names = list(inspect.signature(fn).parameters)
@@ -122,7 +123,7 @@ def effect_function_tool(
             # The SDK passes parsed arguments positionally per our declared
             # signature; rebind them to names — they are the key material.
             bound = dict(zip(fn_param_names, args, strict=False)) | kwargs
-            scope = _resolve_scope(ctx, tool)
+            scope = _resolve_scope(ctx, tool_name)
             if dedup == "call":
                 call_id = getattr(ctx, "tool_call_id", None)
                 if call_id:
@@ -137,7 +138,7 @@ def effect_function_tool(
                     return _signal(
                         "approval_required",
                         pending.effect_id,
-                        tool,
+                        tool_name,
                         instructions=(
                             "This action is parked until a human approves it. Tell the "
                             "user, and after approval call this tool again with exactly "
@@ -148,7 +149,7 @@ def effect_function_tool(
                     return _signal(
                         "outcome_unknown",
                         unknown.record.effect_id,
-                        tool,
+                        tool_name,
                         instructions=(
                             "The outcome of this action is ambiguous (it may have "
                             "happened). Do NOT retry or work around it; a reconciler "
@@ -159,7 +160,7 @@ def effect_function_tool(
                     return _signal(
                         "denied",
                         denied.record.effect_id,
-                        tool,
+                        tool_name,
                         reason=denied.record.note or "",
                         instructions="A human denied this action. Do not attempt it again.",
                     )

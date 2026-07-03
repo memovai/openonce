@@ -103,15 +103,20 @@ class TestDedupAndReplay:
             do(x=1)
         assert do(x=1, idempotency_key="k") == 1  # explicit key needs no scope
 
-    def test_positional_args_rejected(self, make_store) -> None:
+    def test_positional_args_bind_to_names(self, make_store) -> None:
+        """Positional calls bind to parameter names — same key as keyword
+        calls (full coverage in test_usability.py)."""
         oo = make_oo(make_store)
+        calls: list[int] = []
 
         @oo.effect(tool="t")
         def do(x: int) -> int:
+            calls.append(x)
             return x
 
-        with oo.scope("r"), pytest.raises(TypeError, match="keywords"):
-            do(1)
+        with oo.scope("r"):
+            assert do(1) == do(x=1) == 1
+        assert calls == [1]
 
 
 class TestApproval:

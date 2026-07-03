@@ -52,16 +52,32 @@ pip install openonce[postgres]   # production store
 
 ## Quickstart
 
+The minimal form is one decorator and one `with` — no names, no config:
+
 ```python
 import openonce
 
 oo = openonce.OpenOnce("openonce.db")   # or ":memory:" — zero infrastructure
 
-@oo.effect(tool="github.create_pr", idempotency_fields=["owner", "repo", "head"])
+@oo.effect                              # tool name = function name
+def send_email(to: str, subject: str) -> str:
+    ...
+
+with oo.scope():                        # auto run id: in-run dedup
+    send_email("a@b.c", "hi")
+    send_email("a@b.c", "hi")           # LLM retry → replayed, not re-sent
+
+protected = oo.effect(existing_tool)    # or wrap an existing callable directly
+```
+
+Dial in precision as you need it:
+
+```python
+@oo.effect(idempotency_fields=["owner", "repo", "head"])
 def create_pr(owner: str, repo: str, head: str, title: str, body: str) -> dict:
     ...  # your real tool code
 
-with oo.scope("run-2026-07-02-a"):          # binds dedup to this agent run
+with oo.scope("run-2026-07-02-a"):          # stable id: crash-resume dedup too
     create_pr(owner="acme", repo="api", head="fix-login", title="Fix login", body="...")
     # The LLM retries with a reworded body — same intent fingerprint, replayed:
     create_pr(owner="acme", repo="api", head="fix-login", title="Fix login", body="reworded")

@@ -31,6 +31,13 @@
   alternatives, not replacements.
 
 ### Added
+- Friction cuts (the Temporal lesson: decorate normal code, no ceremony):
+  bare `@oo.effect` and `oo.effect(fn)` work — `tool` defaults to the
+  function name (core and both framework adapters); positional arguments
+  bind to parameter names via the handler signature (same key as keyword
+  calls; `*args`/positional-only rejected at decoration with clear errors);
+  `oo.scope()` with no argument generates a run id (in-run dedup — pass a
+  stable id for crash-resume dedup) and `scope()` now yields the active id.
 - OpenAI Agents adapter: `dedup="call"` — the LLM's `tool_call_id` narrows
   the scope so each model decision is its own effect; retries of the same
   call still dedupe. Auditable via `record.scope`. Default `"intent"`
